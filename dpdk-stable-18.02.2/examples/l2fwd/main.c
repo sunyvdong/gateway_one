@@ -39,6 +39,9 @@
 #include <rte_mempool.h>
 #include <rte_mbuf.h>
 
+#include "global.h"
+
+
 static volatile bool force_quit;
 
 /* MAC updating enabled by default */
@@ -58,14 +61,10 @@ static int mac_updating = 1;
 static uint16_t nb_rxd = RTE_TEST_RX_DESC_DEFAULT;
 static uint16_t nb_txd = RTE_TEST_TX_DESC_DEFAULT;
 
-/* ethernet addresses of ports */
-static struct ether_addr l2fwd_ports_eth_addr[RTE_MAX_ETHPORTS];
 
 /* mask of enabled ports */
 static uint32_t l2fwd_enabled_port_mask = 0;
 
-/* list of enabled ports */
-static uint32_t l2fwd_dst_ports[RTE_MAX_ETHPORTS];
 
 static unsigned int l2fwd_rx_queue_per_lcore = 1;
 
@@ -154,34 +153,80 @@ static void
 l2fwd_mac_updating(struct rte_mbuf *m, unsigned dest_portid)
 {
 	struct ether_hdr *eth;
-	void *tmp;
 
 	eth = rte_pktmbuf_mtod(m, struct ether_hdr *);
 
 	/* 02:00:00:00:00:xx */
-	tmp = &eth->d_addr.addr_bytes[0];
-	*((uint64_t *)tmp) = 0x000000000002 + ((uint64_t)dest_portid << 40);
+	//tmp = &eth->d_addr.addr_bytes[0];
+	//*((uint64_t *)tmp) = 0x000000000002 + ((uint64_t)dest_portid << 40);
 
 	/* src addr */
-	ether_addr_copy(&l2fwd_ports_eth_addr[dest_portid], &eth->s_addr);
+	ether_addr_copy(&g_config.port_info[dest_portid].mac_addr, &eth->s_addr);
+}
+
+static void
+handle_pkt_data(struct rte_mbuf *m, unsigned portid)
+{
+	sz_pkt_data pkt_data;
+	pkt_data.addr = rte_pktmbuf_mtod_offset(m, char *, 0);
+	pkt_data.len = rte_pktmbuf_data_len(m);
+	memset(&g_config.result, 0, sizeof(g_config.result));
+	g_config.cur_portid = portid;
+	g_ft_root->pkt_data_cb.pkt_data_handle(&pkt_data, (void *)&g_config);
+	return ;
+}
+
+static unsigned short *
+get_ports_num_addr(struct rte_mbuf *m)
+{
+	unsigned short *ports_num_ptr = (unsigned short *)m->buf_addr;
+	return ports_num_ptr;
+}
+
+static void
+self_mbuf_free(struct rte_mbuf *m)
+{
+	unsigned short *ports_num_ptr = get_ports_num_addr(m);
+	if(0 == *ports_num_ptr)
+	{
+		rte_mbuf_raw_free(m);
+	}
+	else
+	{
+		--(*ports_num_ptr);
+	}
 }
 
 static void
 l2fwd_simple_forward(struct rte_mbuf *m, unsigned portid)
 {
-	unsigned dst_port;
+	unsigned short dst_port;
+	unsigned short index, indexson;
 	int sent;
 	struct rte_eth_dev_tx_buffer *buffer;
 
-	dst_port = l2fwd_dst_ports[portid];
+	handle_pkt_data(m, portid);
 
-	if (mac_updating)
-		l2fwd_mac_updating(m, dst_port);
+	unsigned short *ports_num_ptr = get_ports_num_addr(m);
+	*ports_num_ptr = g_config.result.tx_ports_num;
+	self_mbuf_free(m);
 
-	buffer = tx_buffer[dst_port];
-	sent = rte_eth_tx_buffer(dst_port, 0, buffer, m);
-	if (sent)
-		port_statistics[dst_port].tx += sent;
+	for(index = 0; index < g_config.result.tx_ports_num; ++index)
+	{
+		dst_port = g_config.result.portids[index];
+		if (mac_updating)
+			l2fwd_mac_updating(m, dst_port);
+
+		buffer = tx_buffer[dst_port];
+		sent = rte_eth_tx_buffer(dst_port, 0, buffer, m);
+		if (sent)
+			port_statistics[dst_port].tx += sent;
+
+		for(indexson = 0; indexson < sent; ++indexson)
+		{
+			self_mbuf_free(buffer->pkts[indexson]);
+		}
+	}
 }
 
 /* main processing loop */
@@ -190,7 +235,7 @@ l2fwd_main_loop(void)
 {
 	struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
 	struct rte_mbuf *m;
-	int sent;
+	int sent, index;
 	unsigned lcore_id;
 	uint64_t prev_tsc, diff_tsc, cur_tsc, timer_tsc;
 	unsigned i, j, portid, nb_rx;
@@ -230,15 +275,19 @@ l2fwd_main_loop(void)
 		diff_tsc = cur_tsc - prev_tsc;
 		if (unlikely(diff_tsc > drain_tsc)) {
 
-			for (i = 0; i < qconf->n_rx_port; i++) {
-
-				portid = l2fwd_dst_ports[qconf->rx_port_list[i]];
+			for (i = 0; i < g_config.ports_num; i++) 
+			{
+				portid = g_config.port_index[i];
 				buffer = tx_buffer[portid];
 
 				sent = rte_eth_tx_buffer_flush(portid, 0, buffer);
 				if (sent)
 					port_statistics[portid].tx += sent;
 
+				for(index = 0; index < sent; ++index)
+				{
+					self_mbuf_free(buffer->pkts[index]);
+				}
 			}
 
 			/* if timer is enabled */
@@ -511,6 +560,45 @@ signal_handler(int signum)
 	}
 }
 
+static int
+read_json(cJSON *node)
+{
+	if(NULL == node)
+		return 0;
+
+	int index;
+	cJSON *node_item;
+	sz_framework_tree_node *ft_parent = NULL;
+	sz_framework_tree_node *ft_son = NULL;
+	if(NULL != node->string)
+		ft_parent = sz_framework_list_find_by_name(g_fl_list, node->string);
+	int array_size = cJSON_GetArraySize(node);
+	for(index = 0; index < array_size; ++index)
+	{
+		node_item = cJSON_GetArrayItem(node, index);
+		ft_son = sz_framework_list_find_by_name(g_fl_list, node_item->string);
+		if(NULL == ft_son)
+		{
+			printf("not find son name:%s node\n", node_item->string);
+			return 1;
+		}
+		if(NULL == g_ft_root)
+		{
+			sz_framework_tree_add_node(&g_ft_root, ft_son);
+		}
+		else
+		{
+			sz_framework_tree_add_node(&ft_parent, ft_son);
+		}
+		if(0 != read_json(node_item))
+		{
+			return 1;
+		}
+	}
+	return 0;
+}
+
+
 int
 main(int argc, char **argv)
 {
@@ -518,11 +606,14 @@ main(int argc, char **argv)
 	int ret;
 	uint16_t nb_ports;
 	uint16_t nb_ports_available = 0;
-	uint16_t portid, last_port;
+	uint16_t portid;
 	unsigned lcore_id, rx_lcore_id;
-	unsigned nb_ports_in_mask = 0;
 	unsigned int nb_lcores = 0;
 	unsigned int nb_mbufs;
+
+	sz_json_config_loader("./framework.json", read_json);
+
+	memset(&g_config, 0, sizeof(g_config));
 
 	/* init EAL */
 	ret = rte_eal_init(argc, argv);
@@ -553,33 +644,6 @@ main(int argc, char **argv)
 	if (l2fwd_enabled_port_mask & ~((1 << nb_ports) - 1))
 		rte_exit(EXIT_FAILURE, "Invalid portmask; possible (0x%x)\n",
 			(1 << nb_ports) - 1);
-
-	/* reset l2fwd_dst_ports */
-	for (portid = 0; portid < RTE_MAX_ETHPORTS; portid++)
-		l2fwd_dst_ports[portid] = 0;
-	last_port = 0;
-
-	/*
-	 * Each logical core is assigned a dedicated TX queue on each port.
-	 */
-	RTE_ETH_FOREACH_DEV(portid) {
-		/* skip ports that are not enabled */
-		if ((l2fwd_enabled_port_mask & (1 << portid)) == 0)
-			continue;
-
-		if (nb_ports_in_mask % 2) {
-			l2fwd_dst_ports[portid] = last_port;
-			l2fwd_dst_ports[last_port] = portid;
-		}
-		else
-			last_port = portid;
-
-		nb_ports_in_mask++;
-	}
-	if (nb_ports_in_mask % 2) {
-		printf("Notice: odd number of ports in portmask.\n");
-		l2fwd_dst_ports[last_port] = last_port;
-	}
 
 	rx_lcore_id = 0;
 	qconf = NULL;
@@ -653,7 +717,8 @@ main(int argc, char **argv)
 				 "Cannot adjust number of descriptors: err=%d, port=%u\n",
 				 ret, portid);
 
-		rte_eth_macaddr_get(portid,&l2fwd_ports_eth_addr[portid]);
+		g_config.port_index[g_config.ports_num] = portid;
+		rte_eth_macaddr_get(portid,&g_config.port_info[portid].mac_addr);
 
 		/* init one RX queue */
 		fflush(stdout);
@@ -709,15 +774,16 @@ main(int argc, char **argv)
 
 		printf("Port %u, MAC address: %02X:%02X:%02X:%02X:%02X:%02X\n\n",
 				portid,
-				l2fwd_ports_eth_addr[portid].addr_bytes[0],
-				l2fwd_ports_eth_addr[portid].addr_bytes[1],
-				l2fwd_ports_eth_addr[portid].addr_bytes[2],
-				l2fwd_ports_eth_addr[portid].addr_bytes[3],
-				l2fwd_ports_eth_addr[portid].addr_bytes[4],
-				l2fwd_ports_eth_addr[portid].addr_bytes[5]);
+				g_config.port_info[portid].mac_addr.addr_bytes[0],
+				g_config.port_info[portid].mac_addr.addr_bytes[1],
+				g_config.port_info[portid].mac_addr.addr_bytes[2],
+				g_config.port_info[portid].mac_addr.addr_bytes[3],
+				g_config.port_info[portid].mac_addr.addr_bytes[4],
+				g_config.port_info[portid].mac_addr.addr_bytes[5]);
 
 		/* initialize port stats */
 		memset(&port_statistics, 0, sizeof(port_statistics));
+		++g_config.ports_num;
 	}
 
 	if (!nb_ports_available) {
@@ -726,6 +792,8 @@ main(int argc, char **argv)
 	}
 
 	check_all_ports_link_status(l2fwd_enabled_port_mask);
+
+	sz_framework_tree_init(g_ft_root, (void *)&g_config);
 
 	ret = 0;
 	/* launch per-lcore init on every lcore */
@@ -746,6 +814,7 @@ main(int argc, char **argv)
 		printf(" Done\n");
 	}
 	printf("Bye...\n");
+	sz_framework_tree_destory(g_ft_root, (void *)&g_config);
 
 	return ret;
 }

@@ -5,7 +5,7 @@
 APP = l2fwd
 
 # all source are stored in SRCS-y
-SRCS-y := main.c
+SRCS-y := main.c global.c common.c cJSON.c link_layer.c arp.c ipv4.c ipv6.c tcp.c udp.c
 
 # Build using pkg-config variables if possible
 $(shell pkg-config --exists libdpdk)
@@ -51,7 +51,7 @@ RTE_TARGET ?= x86_64-native-linuxapp-gcc
 include $(RTE_SDK)/mk/rte.vars.mk
 
 CFLAGS += -DALLOW_EXPERIMENTAL_API
-CFLAGS += -O3
+CFLAGS += -g -O0
 CFLAGS += $(WERROR_FLAGS)
 
 include $(RTE_SDK)/mk/rte.extapp.mk
